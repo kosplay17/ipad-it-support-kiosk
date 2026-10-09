@@ -12,7 +12,7 @@ final class KioskViewController: UIViewController {
     private var idleTimer: Timer?
     private var toastTimer: Timer?
     private var retryWorkItem: DispatchWorkItem?
-    private var passwordSubmissions: [Date] = []
+    private var loginSubmissions: [Date] = []
 
     override var prefersStatusBarHidden: Bool { true }
     override var prefersHomeIndicatorAutoHidden: Bool { true }
@@ -25,6 +25,7 @@ final class KioskViewController: UIViewController {
         setUpHomeButton()
         setUpToast()
         setUpActivityRecognizer()
+        CredentialsStore.importProvisioningFile()
         loadHome()
     }
 
@@ -45,19 +46,34 @@ final class KioskViewController: UIViewController {
         let handler = WeakScriptMessageHandler(self)
         contentController.add(handler, name: Scripts.activityHandler)
         contentController.add(handler, name: Scripts.loginHandler)
+        #if DEBUG
+        contentController.addUserScript(WKUserScript(
+            source: Scripts.errorReporter,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+        contentController.add(handler, name: Scripts.debugHandler)
+        #endif
 
         let configuration = WKWebViewConfiguration()
         configuration.userContentController = contentController
         configuration.websiteDataStore = .default()
         configuration.allowsInlineMediaPlayback = true
         configuration.dataDetectorTypes = []
-        configuration.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
+        // Без версии Safari сайты Яндекса считают WebView устаревшим браузером.
+        let osMajor = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        configuration.applicationNameForUserAgent = "Version/\(osMajor).0 Safari/605.1.15"
 
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsLinkPreview = false
+        #if DEBUG
+        if #available(iOS 16.4, *) {
+            webView.isInspectable = true
+        }
+        #endif
         webView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(webView)
 
@@ -161,7 +177,7 @@ final class KioskViewController: UIViewController {
     }
 
     private func idleTimeoutFired() {
-        // Не сбрасываем, пока открыто меню администратора или идёт вход в Яндекс ID.
+        // Не сбрасываем, пока открыто меню администратора или идёт вход.
         if presentedViewController != nil || KioskConfig.isAuthHost(webView.url?.host) {
             registerActivity()
             return
@@ -178,13 +194,14 @@ final class KioskViewController: UIViewController {
         }
 
         let now = Date()
-        passwordSubmissions.removeAll { now.timeIntervalSince($0) > KioskConfig.passwordSubmissionWindow }
-        guard passwordSubmissions.count < KioskConfig.maxPasswordSubmissions else {
+        loginSubmissions.removeAll { now.timeIntervalSince($0) > KioskConfig.loginSubmissionWindow }
+        guard loginSubmissions.count < KioskConfig.maxLoginSubmissions else {
             showToast("Автовход приостановлен: несколько неудачных попыток подряд")
             return
         }
 
-        let script = Scripts.autoLogin(credentials, allowedHosts: KioskConfig.authHosts)
+        let totpCode = credentials.totpSecret.flatMap { TOTP.code(secret: $0) }
+        let script = Scripts.autoLogin(credentials, totpCode: totpCode, allowedHosts: KioskConfig.authHosts)
         webView.evaluateJavaScript(script) { [log] _, error in
             if let error {
                 log.error("Auto login script failed: \(error.localizedDescription, privacy: .public)")
@@ -200,13 +217,22 @@ final class KioskViewController: UIViewController {
         // 102: загрузка прервана политикой навигации (мы сами её отменили).
         if nsError.domain == "WebKitErrorDomain" && nsError.code == 102 { return }
 
-        log.error("Load failed: \(nsError.localizedDescription, privacy: .public)")
+        trace("Load failed: \(nsError.domain) \(nsError.code) \(nsError.localizedDescription) \(nsError.userInfo[NSURLErrorFailingURLStringErrorKey] ?? "")")
         showToast("Нет соединения. Повторная попытка через 10 секунд")
 
         retryWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.loadHome() }
         retryWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: work)
+    }
+
+    // MARK: - Diagnostics
+
+    private func trace(_ message: String) {
+        log.notice("\(message, privacy: .public)")
+        #if DEBUG
+        FileHandle.standardError.write(Data("[kiosk] \(message)\n".utf8))
+        #endif
     }
 
     // MARK: - Toast
@@ -239,16 +265,23 @@ final class KioskViewController: UIViewController {
     }
 
     private func showAdminMenu() {
-        let login = CredentialsStore.load()?.login ?? "не задана"
+        let credentials = CredentialsStore.load()
+        let login = credentials?.login ?? "не задана"
+        let totpStatus = credentials?.totpSecret == nil ? "не задан" : "задан"
         let currentURL = webView.url?.absoluteString ?? "—"
         let menu = UIAlertController(
             title: "Администрирование",
-            message: "Учётная запись: \(login)\nТекущий адрес: \(currentURL)",
+            message: "Учётная запись: \(login)\nСекрет 2FA: \(totpStatus)\nТекущий адрес: \(currentURL)",
             preferredStyle: .alert
         )
-        menu.addAction(UIAlertAction(title: "Задать логин и пароль Яндекс ID", style: .default) { [weak self] _ in
+        menu.addAction(UIAlertAction(title: "Задать логин и пароль", style: .default) { [weak self] _ in
             self?.showCredentialsForm()
         })
+        if credentials != nil {
+            menu.addAction(UIAlertAction(title: "Задать секрет 2FA (TOTP)", style: .default) { [weak self] _ in
+                self?.showTOTPForm()
+            })
+        }
         menu.addAction(UIAlertAction(title: "Перезагрузить главную", style: .default) { [weak self] _ in
             self?.loadHome()
         })
@@ -260,9 +293,9 @@ final class KioskViewController: UIViewController {
         menu.addAction(UIAlertAction(title: "Выйти из аккаунта и очистить данные", style: .destructive) { [weak self] _ in
             self?.resetWebsiteData()
         })
-        menu.addAction(UIAlertAction(title: "Удалить сохранённые логин и пароль", style: .destructive) { [weak self] _ in
+        menu.addAction(UIAlertAction(title: "Удалить логин, пароль и секрет 2FA", style: .destructive) { [weak self] _ in
             CredentialsStore.clear()
-            self?.showToast("Логин и пароль удалены")
+            self?.showToast("Учётные данные удалены")
         })
         menu.addAction(UIAlertAction(title: "Закрыть", style: .cancel))
         present(menu, animated: true)
@@ -292,10 +325,39 @@ final class KioskViewController: UIViewController {
             let password = fields[1].text ?? ""
             guard !login.isEmpty, !password.isEmpty else { return }
 
-            CredentialsStore.save(Credentials(login: login, password: password))
-            self?.passwordSubmissions.removeAll()
+            let totpSecret = CredentialsStore.load()?.totpSecret
+            CredentialsStore.save(Credentials(login: login, password: password, totpSecret: totpSecret))
+            self?.loginSubmissions.removeAll()
             self?.showToast("Учётные данные сохранены")
             self?.loadHome()
+        })
+        present(form, animated: true)
+    }
+
+    private func showTOTPForm() {
+        let form = UIAlertController(
+            title: "Секрет 2FA",
+            message: "Ключ TOTP в формате Base32 (как при настройке приложения-аутентификатора)",
+            preferredStyle: .alert
+        )
+        form.addTextField { field in
+            field.placeholder = "Секрет"
+            field.isSecureTextEntry = true
+            field.autocapitalizationType = .allCharacters
+            field.autocorrectionType = .no
+        }
+        form.addAction(UIAlertAction(title: "Отмена", style: .cancel))
+        form.addAction(UIAlertAction(title: "Сохранить", style: .default) { [weak self, weak form] _ in
+            let secret = (form?.textFields?.first?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard var credentials = CredentialsStore.load() else { return }
+            guard TOTP.code(secret: secret) != nil else {
+                self?.showToast("Неверный формат секрета")
+                return
+            }
+            credentials.totpSecret = secret
+            CredentialsStore.save(credentials)
+            self?.loginSubmissions.removeAll()
+            self?.showToast("Секрет 2FA сохранён")
         })
         present(form, animated: true)
     }
@@ -303,7 +365,7 @@ final class KioskViewController: UIViewController {
     private func resetWebsiteData() {
         let store = WKWebsiteDataStore.default()
         store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast) { [weak self] in
-            self?.passwordSubmissions.removeAll()
+            self?.loginSubmissions.removeAll()
             self?.loadHome()
         }
     }
@@ -332,18 +394,38 @@ extension KioskViewController: WKNavigationDelegate {
         }
 
         if isAllowedMainFrameNavigation(to: url) {
+            trace("Allowed: \(url.absoluteString)")
             decisionHandler(.allow)
             return
         }
 
-        log.info("Blocked: \(url.absoluteString, privacy: .public)")
-        if navigationAction.navigationType == .linkActivated || navigationAction.targetFrame == nil {
-            showToast("Этот адрес недоступен в киоске")
-        }
+        trace("Blocked: \(url.absoluteString)")
+        showToast("Адрес недоступен в киоске: \(url.host ?? url.absoluteString)")
         decisionHandler(.cancel)
     }
 
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationResponse: WKNavigationResponse,
+        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void
+    ) {
+        if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse {
+            trace("Response \(response.statusCode) \(response.mimeType ?? "-"): \(response.url?.absoluteString ?? "-")")
+        }
+        decisionHandler(.allow)
+    }
+
+    func webView(_ webView: WKWebView, didReceiveServerRedirectForProvisionalNavigation navigation: WKNavigation!) {
+        trace("Redirect: \(webView.url?.absoluteString ?? "-")")
+    }
+
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        trace("Finished: \(webView.url?.absoluteString ?? "-")")
+        #if DEBUG
+        webView.evaluateJavaScript(Scripts.pageSummary) { [weak self] result, error in
+            self?.trace("Page: \(result as? String ?? error?.localizedDescription ?? "-")")
+        }
+        #endif
         if KioskConfig.isAuthHost(webView.url?.host) {
             runAutoLoginIfNeeded()
         } else if !isHome(webView.url) {
@@ -360,6 +442,7 @@ extension KioskViewController: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        trace("Web content process terminated")
         loadHome()
     }
 }
@@ -393,7 +476,9 @@ extension KioskViewController: WKScriptMessageHandler {
         case Scripts.activityHandler:
             registerActivity()
         case Scripts.loginHandler:
-            passwordSubmissions.append(Date())
+            loginSubmissions.append(Date())
+        case Scripts.debugHandler:
+            trace("\(message.body)")
         default:
             break
         }

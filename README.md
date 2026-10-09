@@ -1,9 +1,10 @@
 # IT Support Kiosk (iPad)
 
 Приложение-киоск для iPad: показывает страницу
-`https://wiki.yandex.ru/sd-portal/it-support/it-support-office/`, пускает только на `yandex.ru` и его
-поддомены (`wiki.yandex.ru`, `form.yandex.ru` и т.д.), имеет кнопку «Домой», через 30 секунд бездействия возвращается на главную и
-автоматически входит в Яндекс ID под сервисной учётной записью.
+`https://wiki.yandex.ru/sd-portal/it-support/it-support-office/`, пускает только на разрешённые домены
+(`yandex.ru` с поддоменами, `auth.cloud.yandex.com`, `sso.ya.ru`, `lamoda.ru`, `lamoda.tech`), имеет кнопку
+«Домой», через 30 секунд бездействия возвращается на главную и автоматически входит под сервисной
+учётной записью, включая код 2FA.
 
 Настройки (адреса, таймаут, PIN администратора) — в `ITSupportKiosk/KioskConfig.swift`.
 
